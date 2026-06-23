@@ -1,0 +1,7 @@
+**/bin
+**/obj
+seed
+.git
+.vs
+deploy/.env
+**/appsettings.*.local.json

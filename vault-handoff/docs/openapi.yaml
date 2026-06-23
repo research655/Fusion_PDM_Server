@@ -1,0 +1,306 @@
+openapi: 3.0.3
+info:
+  title: Vault PDM API
+  version: 0.2.0
+  description: >
+    Custom PDM for Fusion 360 files. Build to this contract first; freeze it
+    before parallel agent work.
+servers:
+  - url: https://localhost:7000
+paths:
+  /auth/google:
+    post:
+      summary: Exchange a Google OAuth code for a Vault session token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties: { code: { type: string } }
+      responses:
+        '200':
+          description: Session issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  user: { $ref: '#/components/schemas/User' }
+        '403': { description: Email not in @sparkrobotic.com }
+  /files/upload:
+    post:
+      summary: Upload a new file (auto checked-out to creator)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, number, description]
+              properties:
+                file: { type: string, format: binary }
+                number:
+                  type: string
+                  pattern: '^[A-Za-z0-9 _-]+$'
+                  description: Letters, numbers, spaces, hyphens, underscores only.
+                description: { type: string }
+                repository:
+                  type: string
+                  description: Vault key (e.g. CAD, DOCS). Optional; defaults to CAD. Filename uniqueness is scoped to this vault.
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/FileCard' } } } }
+        '400': { description: Invalid Number (disallowed characters) }
+        '404': { description: Repository (vault) not found }
+        '409': { description: Duplicate filename in this vault (case-insensitive, extension excluded) }
+  /files/{id}:
+    get:
+      summary: Get a file's data card
+      description: Read-only Users (assemblers) see only Production files; other states return 404 to them.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/FileCard' } } } }
+        '404': { description: Not found, or not visible to the caller }
+  /files/{id}/content:
+    get:
+      summary: Download the current vault file bytes (populates the local cache)
+      description: Subject to the same visibility rule as the data card — assemblers can download only Production files.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: File bytes
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '404': { description: Not found, or not visible to the caller }
+  /files/check-out:
+    post:
+      summary: "[Engineer/Admin] Check out a file for editing (only Initial or Under Change)"
+      requestBody: { $ref: '#/components/requestBodies/FileId' }
+      responses:
+        '200': { description: Checked out }
+        '403': { description: Caller lacks write access (read-only User) }
+        '409': { description: Already checked out by another user }
+        '422': { description: File is not in a checkout-able state (return a rejected file to editable first) }
+  /files/check-in:
+    post:
+      summary: Check in the working copy (uploads changes, releases the lock, read-only again)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [fileId, file]
+              properties:
+                fileId: { type: string, format: uuid }
+                file: { type: string, format: binary, description: The edited working copy }
+      responses:
+        '200': { description: Checked in; vault content updated and contentVersion bumped (revision unchanged) }
+        '403': { description: Caller does not hold the check-out }
+        '404': { description: Not found }
+        '409': { description: Duplicate Number or filename (blocks check-in) }
+  /files/force-check-in:
+    post:
+      summary: "[Admin] EMERGENCY: release another user's check-out, keeping the last vaulted state (no upload)"
+      description: Abandons the holder's un-checked-in local edits and releases the lock. Content/revision unchanged; the holder's later check-in will 403.
+      requestBody: { $ref: '#/components/requestBodies/FileId' }
+      responses:
+        '200': { description: Lock released, content: { application/json: { schema: { $ref: '#/components/schemas/FileCard' } } } }
+        '403': { description: Caller is not an Admin }
+        '422': { description: File is not checked out }
+  /files/submit-approval:
+    post:
+      summary: "[Engineer/Admin] Submit for approval (Initial/UnderChange/Rejected -> AwaitingApproval; must be checked in)"
+      requestBody: { $ref: '#/components/requestBodies/FileId' }
+      responses:
+        '200': { description: Submitted }
+        '403': { description: Caller lacks write access }
+        '422': { description: Invalid state transition, or the file is still checked out }
+  /files/return-to-editable:
+    post:
+      summary: "Back to Initial / Under Change — undo a pending submission (submitter) OR return a rejected file to editable (Engineer/Admin). No approver notification."
+      requestBody: { $ref: '#/components/requestBodies/FileId' }
+      responses:
+        '200': { description: Now editable, content: { application/json: { schema: { $ref: '#/components/schemas/FileCard' } } } }
+        '403': { description: Not the submitter (from Awaiting Approval) or lacks write access (from Rejected) }
+        '422': { description: File is not Awaiting Approval or in a rejected state }
+  /files/{id}/card:
+    post:
+      summary: "Edit the data card (Number / filename / Description) — only while the caller holds the check-out"
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                number: { type: string, description: "New Number (validated charset, unique in vault)" }
+                name: { type: string, description: "New filename (unique in vault, case-insensitive)" }
+                description: { type: string }
+      responses:
+        '200': { description: Card updated, content: { application/json: { schema: { $ref: '#/components/schemas/FileCard' } } } }
+        '400': { description: Invalid Number charset }
+        '403': { description: Caller does not hold the check-out }
+        '409': { description: Duplicate Number or filename }
+  /files/approve:
+    post:
+      summary: Approve (AwaitingApproval -> Production, increments revision, snapshots backup)
+      requestBody: { $ref: '#/components/requestBodies/FileId' }
+      responses:
+        '200': { description: Approved, content: { application/json: { schema: { $ref: '#/components/schemas/FileCard' } } } }
+        '403': { description: Caller lacks approval rights (e.g. Engineer approving own work) }
+        '422': { description: Invalid state transition }
+  /files/reject:
+    post:
+      summary: Reject (routes to Initial,Rejected or Under Change,Rejected by origin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fileId]
+              properties:
+                fileId: { type: string, format: uuid }
+                reason: { type: string }
+      responses:
+        '200': { description: Rejected }
+        '422': { description: Invalid state transition }
+  /files/begin-change:
+    post:
+      summary: "[Admin/Engineer] Move a Production file to Under Change (then it can be checked out)"
+      requestBody: { $ref: '#/components/requestBodies/FileId' }
+      responses:
+        '200': { description: Now Under Change, content: { application/json: { schema: { $ref: '#/components/schemas/FileCard' } } } }
+        '403': { description: Caller is not an Admin or Engineer }
+        '422': { description: File is not in Production }
+  /files/obsolete:
+    post:
+      summary: "[Admin/Engineer] Mark a Production OR Prototype file Obsolete (records the prior state for Recover)"
+      requestBody: { $ref: '#/components/requestBodies/FileId' }
+      responses:
+        '200': { description: Now Obsolete, content: { application/json: { schema: { $ref: '#/components/schemas/FileCard' } } } }
+        '403': { description: Caller is not an Admin or Engineer }
+        '422': { description: File is not in Production or Prototype }
+  /files/reactivate:
+    post:
+      summary: "[Admin] Recover an Obsolete file to the EXACT prior state (Production or Prototype)"
+      requestBody: { $ref: '#/components/requestBodies/FileId' }
+      responses:
+        '200': { description: Restored to prior state, content: { application/json: { schema: { $ref: '#/components/schemas/FileCard' } } } }
+        '403': { description: Caller is not an Admin }
+        '422': { description: File is not Obsolete }
+  /files/prototype:
+    post:
+      summary: "[Admin/Engineer] Move a checked-in, never-approved (Initial) file to Prototype (no approval, no revision, no history)"
+      requestBody: { $ref: '#/components/requestBodies/FileId' }
+      responses:
+        '200': { description: Now Prototype, content: { application/json: { schema: { $ref: '#/components/schemas/FileCard' } } } }
+        '403': { description: Caller is not an Admin or Engineer }
+        '422': { description: File is not in Initial, or is still checked out }
+  /files/prototype/exit:
+    post:
+      summary: "[Admin/Engineer] Move a Prototype file back to Initial (no approval, no revision, no history)"
+      requestBody: { $ref: '#/components/requestBodies/FileId' }
+      responses:
+        '200': { description: Now Initial, content: { application/json: { schema: { $ref: '#/components/schemas/FileCard' } } } }
+        '403': { description: Caller is not an Admin or Engineer }
+        '422': { description: File is not in Prototype }
+  /search:
+    get:
+      summary: Search files (archived snapshots are never returned)
+      description: Scoped to one vault (repository, default CAD). Read-only Users receive only Production files.
+      parameters:
+        - { name: number, in: query, schema: { type: string } }
+        - { name: description, in: query, schema: { type: string } }
+        - { name: revision, in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string } }
+        - { name: designer, in: query, schema: { type: string } }
+        - { name: repository, in: query, schema: { type: string }, description: "Vault key (default CAD)" }
+        - { name: createdFrom, in: query, schema: { type: string, format: date } }
+        - { name: createdTo, in: query, schema: { type: string, format: date } }
+        - { name: updatedFrom, in: query, schema: { type: string, format: date } }
+        - { name: updatedTo, in: query, schema: { type: string, format: date } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/FileCard' } } } } }
+  /files/{id}/revisions:
+    get:
+      summary: "[Admin] List archived revisions for a file (rollback targets)"
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/RevisionBackup' } } } } }
+        '403': { description: Caller is not an Admin }
+        '404': { description: File not found }
+  /files/rollback:
+    post:
+      summary: "[Admin] Roll back a file to a previous revision (replaces the live file)"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fileId, targetRevision]
+              properties:
+                fileId: { type: string, format: uuid }
+                targetRevision: { type: string, example: "B" }
+      responses:
+        '200': { description: Rolled back, content: { application/json: { schema: { $ref: '#/components/schemas/FileCard' } } } }
+        '403': { description: Caller is not an Admin }
+        '404': { description: File or target revision not found }
+components:
+  requestBodies:
+    FileId:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [fileId]
+            properties: { fileId: { type: string, format: uuid } }
+  schemas:
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string }
+        displayName: { type: string }
+        role: { type: string, enum: [Admin, Engineer, User] }
+    RevisionBackup:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        revision: { type: string }
+        approvedBy: { type: string, format: uuid, nullable: true }
+        approvedDate: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+    FileCard:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        repository: { type: string, description: "Vault key this file belongs to (e.g. CAD)" }
+        number: { type: string }
+        name: { type: string }
+        description: { type: string }
+        revision: { type: string, nullable: true }
+        state:
+          type: string
+          enum: [Initial, AwaitingApproval, Production, UnderChange, InitialRejected, UnderChangeRejected, Obsolete, Prototype]
+        checkedOutBy: { type: string, format: uuid, nullable: true }
+        designedBy: { type: string, format: uuid }
+        designedDate: { type: string, format: date-time }
+        approvedBy: { type: string, format: uuid, nullable: true }
+        approvedDate: { type: string, format: date-time, nullable: true }
+        changedBy: { type: string, format: uuid, nullable: true }
+        changedDate: { type: string, format: date-time, nullable: true }
+        createdDate: { type: string, format: date-time }
+        updatedDate: { type: string, format: date-time }
+        contentVersion: { type: integer, description: Bumped on every content change; used for client cache invalidation }

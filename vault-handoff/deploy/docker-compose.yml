@@ -1,0 +1,48 @@
+# Vault PDM — API + PostgreSQL on a Docker-capable NAS.
+# Run from the repo root:  cd deploy && docker compose up -d --build
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: vault
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+    volumes:
+      - vault-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d vault"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ConnectionStrings__Vault: "Host=db;Port=5432;Database=vault;Username=postgres;Password=${POSTGRES_PASSWORD}"
+      Storage__Provider: Local
+      Storage__Local__RootPath: /data/vault
+      Auth__Provider: Stub
+      Auth__AllowedDomain: sparkrobotic.com
+      Notifications__Provider: Stub
+    volumes:
+      # Blobs live on the UniFi NAS, mounted over NFS (see the vault-blobs volume below).
+      - vault-blobs:/data/vault
+    ports:
+      - "8080:8080"
+
+volumes:
+  vault-pgdata:
+  vault-blobs:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=${UNAS_IP:?set UNAS_IP in deploy/.env},rw,nfsvers=3,nolock"
+      device: ":${UNAS_EXPORT_PATH:?set UNAS_EXPORT_PATH in deploy/.env}"

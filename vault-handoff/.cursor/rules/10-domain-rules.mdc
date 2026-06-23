@@ -1,0 +1,63 @@
+---
+description: The non-obvious domain rules. Get these exactly right.
+globs: src/Vault.Domain/**,src/Vault.Api/**
+alwaysApply: true
+---
+
+# Domain rules — do not get these wrong
+
+## Revisions
+- First approval = A. Each approval increments. **Skip I and L.** Use `RevisionSequence` (seeded + tested). Do not reimplement.
+- Revision changes ONLY on approval.
+
+## State machine
+- 8 states (incl. Obsolete and Prototype). Use `FileStateMachine.Next` for every transition; undefined transitions throw → HTTP 422.
+- Record `Origin` when entering AwaitingApproval (`FileStateMachine.OriginFor`); reject routes by it.
+- Set `SubmittedBy = actor` on every submit (needed for the self-approval check).
+- **Checkout only when `FileStateMachine.IsCheckOutable(state)`** — now **Initial or Under Change only**; else HTTP 422. Rejected files are NOT checkout-able: `ReturnToEditable` them first (`InitialRejected → Initial`, `UnderChangeRejected → UnderChange`), Engineer/Admin. Check-out/in may repeat; check-in never changes state or revision.
+- **Submit requires the file to be checked in** (else 422). Submit is allowed from Initial, Under Change, and either rejected state (resubmit as-is).
+- **Production exit (BeginChange, MarkObsolete) is Admin/Engineer only** via `ProductionPolicy.CanChangeProductionState` → HTTP 403 for Users. **MarkObsolete is valid from Production OR Prototype** and records `ObsoletedFromState` (422 from any other state).
+- **Recover (`ReactivateAsync`) is Admin only** → 403 for Engineers/Users. Restores the file to `ObsoletedFromState` (Production or Prototype) and clears it; 422 if the file is not Obsolete. The state machine does **not** route this (target is data-driven) — the service sets it directly.
+- **`ReturnToEditable`** (one trigger, two uses, **no approver notification**): from `AwaitingApproval` it is **undo submit**, allowed **only to the submitter** (`SubmittedBy == actor`, else 403), routing to `Initial`/`UnderChange` by `Origin`; from a **rejected** state it returns to editable and requires **write access** (Engineer/Admin). Clear `SubmittedBy`/`Origin`.
+- **Data card edit (`UpdateCardAsync`, `POST /files/{id}/card`)**: only the **check-out holder** (else 403) may change Number/filename/Description; re-validate uniqueness.
+- **Check-in is blocked on duplicates**: a non-unique Number **or** a duplicate filename → HTTP 409 (`EnsureNumberAndNameUniqueAsync`, also applied on upload and card edit). Keep `NameKey` in sync with `Name` at check-in.
+- **Client rules (apps, not the API):** every state change requires a **confirmation dialog with Cancel**; a file must be **checked out before it is opened**; **check-out and check-in fail if the file is open** in an app. Admin actions (Force Check-In, Recover Obsolete File) live in the Admin context menu, **greyed unless their conditions are met** (Force Check-In only when actively checked out; both Admin-only).
+- **Prototype** (pseudo-Production for one-off tooling/test items): `EnterPrototype` (`Initial → Prototype`, file must be **checked in**) and `ExitPrototype` (`Prototype → Initial`) are **Admin/Engineer only** (`WriteAccessPolicy`), **no approval**. Never-approved files only (that is why it branches off `Initial`). These transitions write **NO history row** and **never change the revision**. Prototype is not checkout-able.
+
+## Number field
+- User-entered, but only letters, numbers, spaces, hyphens, underscores. Validate with `FileNumber.Validate` → HTTP 400 on bad input.
+- **Unique per vault (case-insensitive).** Duplicate Number → HTTP 409 (`DuplicateNumberException`), checked on upload, card edit, and check-in.
+
+## Filename uniqueness
+- Compare on `FileNaming.ToKey(name)` = lower-cased name WITHOUT extension. Case-insensitive, extension-agnostic.
+- Store as `NameKey`; uniqueness is a **composite unique index `(RepositoryId, NameKey)`** — scoped per vault, so the same name may exist in CAD and DOCS. Duplicate within a vault → HTTP 409 (`DuplicateNameException`).
+
+## Repository (vault) dimension
+- Every file has a `RepositoryId`. Upload resolves the `repository` key (default `WellKnownRepositories.DefaultKey` = `CAD`) → 404 if the vault is unknown. Search is scoped to one vault (default CAD).
+- A documentation vault is added by inserting one `Repository` row — never a schema change. Do not hardcode the CAD id; resolve by key.
+
+## Approval — segregation of duties
+- Enforce `ApprovalPolicy.CanApprove(approverRole, approverId, file.SubmittedBy)` on approve.
+- Engineer approving own submission → HTTP 403 (`ForbiddenActionException`). Admin may self-approve.
+
+## Rollback & backups
+- On EVERY approval into Production, write a `FileRevisionBackup` snapshot (binary copy via IFileStore + data-card metadata).
+- Backups are HIDDEN: never include them in `/search` or `GET /files/{id}`.
+- `GET /files/{id}/revisions` and `POST /files/rollback` are **Admin only** → non-admin gets HTTP 403.
+- Rollback replaces the live file (content + revision + data-card fields) from the chosen snapshot, sets state Production, and appends a history row: `Rolled back to {revision} by {admin display name}`.
+- Retain all snapshots; rollback only changes which one is active.
+
+## Local cache & content
+- **Write access (Engineer/Admin) is required to check out, check in, or submit** (`WriteAccessPolicy.CanEdit`); read-only Users get 403.
+- Any **checked-in** file may be checked out by any write-access user. Only the check-out holder may change vault content. Check-in by a non-holder → HTTP 403 (`ForbiddenActionException`).
+- Check-in uploads the working copy as the new content and bumps `ContentVersion`. It does NOT change `Revision` (only approval does). Check-out/in is repeatable; encourage frequent check-in (don't strand work in a local cache).
+- **Force-check-in (Admin only):** releases another holder's check-out WITHOUT uploading bytes — content/revision unchanged, `CheckedOutBy` cleared, history row written. The prior holder's later check-in 403s (they no longer hold it). A new file never checked in keeps only its original upload (likely empty).
+- `GET /files/{id}/content` streams current bytes for the client cache. Read-only (not-checked-out) opens never write back to the vault.
+
+## Read visibility (assemblers)
+- Role `User` (assemblers) may read only `Production` and `Prototype` files. Enforce on EVERY read path — `GetAsync`, `GetContentAsync`, `SearchAsync` — via `FileVisibility.CanView(role, state)`.
+- Non-visible file for a User → HTTP 404 (hide existence, do not 403). Unknown/unauthenticated caller = least privilege (treated as User).
+- Engineers and Admins see all states.
+
+## Permissions
+- Admin: everything incl. user management + rollback. Engineer: full file access, no user mgmt, no self-approval. User: **read-only assembler** — sees only Production (see Read visibility).

@@ -1,0 +1,26 @@
+---
+description: Vault PDM project conventions and architecture
+globs:
+alwaysApply: true
+---
+
+# Vault PDM — project rules
+
+You are building a custom PDM for Fusion 360 files. Stack is **.NET 8 / C#**.
+
+## Architecture
+- `src/Vault.Api` — ASP.NET Core Minimal APIs. Thin: validate, call domain/services, map to DTOs.
+- `src/Vault.Domain` — pure domain logic, NO external dependencies. Revision + state machine live here.
+- **Vaults:** every file belongs to a `Repository` (logical vault). CAD ships first and is the default; documentation is a future vault added as one row (filename uniqueness + search are scoped per vault). Don't build a second vault until the Fusion feasibility spike passes (`TASKS.md` Phase 0).
+- `src/Vault.Infrastructure` — EF Core (Npgsql/PostgreSQL), `IFileStore`, `IAuthProvider`, `INotificationService` implementations.
+- `tests/Vault.Tests` — xUnit. New domain logic ships with tests.
+
+## Hard rules
+- Build to `docs/openapi.yaml`. Do not invent endpoint shapes; if the contract is wrong, fix the contract first, then code.
+- External integrations sit behind interfaces with a **stub default**. The app must run with no Google/Asana secrets configured.
+- Storage goes through `IFileStore`. Default = local filesystem. Do not hardcode paths or S3 calls in handlers.
+- No secrets in source. Config via `appsettings` + environment / user-secrets.
+
+## Style
+- Nullable reference types on. Treat warnings as errors in domain.
+- Prefer records for DTOs. Keep handlers small.

@@ -1,0 +1,11 @@
+---
+description: Contract-first workflow
+globs: src/Vault.Api/**
+alwaysApply: true
+---
+
+# API contract is the source of truth
+- `docs/openapi.yaml` defines all 9 endpoints, request/response shapes, and status codes.
+- Every endpoint returns the documented status codes, especially 409 (duplicate / checkout conflict) and 422 (invalid transition).
+- Validate auth: only `@sparkrobotic.com` emails get a session.
+- Do not begin parallel/worktree work until this contract is frozen for the milestone.
