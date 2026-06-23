@@ -1,3 +1,4 @@
+```mermaid
 %% Vault PDM — File Workflow (v3.5)
 %% Keep this in sync with the project whenever the workflow changes.
 %% v3.5: "Back to Initial/Under Change" (undo submit from Awaiting, OR return a rejected file to
@@ -47,3 +48,4 @@ stateDiagram-v2
       Visible to ALL. Can be obsoleted and
       recovered back to Prototype.
     end note
+```
